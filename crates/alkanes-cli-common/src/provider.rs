@@ -2253,54 +2253,39 @@ impl WalletProvider for ConcreteProvider {
     }
     
     async fn sync(&self) -> Result<()> {
-        log::info!("Starting backend synchronization...");
-        let max_retries = 60; // ~2 minutes timeout
+        // Mainnet: quick sync (3 attempts, 6s max) — indexers are near tip
+        // Regtest/devnet: full sync (60 attempts, 120s) — blocks mined manually
+        let is_mainnet = self.get_network() == bitcoin::Network::Bitcoin;
+        let max_retries: u32 = if is_mainnet { 3 } else { 60 };
+
         for i in 0..max_retries {
-            // 1. Get bitcoind height (source of truth)
             let bitcoind_height = match self.get_block_count().await {
                 Ok(h) => h,
                 Err(e) => {
-                    log::warn!("Attempt {}: Failed to get bitcoind height: {}. Retrying...", i + 1, e);
+                    log::warn!("Sync {}/{}: bitcoind height failed: {}", i + 1, max_retries, e);
                     self.sleep_ms(2000).await;
                     continue;
                 }
             };
 
-            // 2. Get other service heights
-            let metashrew_height_res = self.get_metashrew_height().await;
-            let esplora_height_res = self.get_blocks_tip_height().await;
-            let ord_height_res = self.get_ord_block_count().await;
-
-            // 3. Check if services are synced
-            // All services should be at least at the same height as bitcoind.
-            let metashrew_synced = metashrew_height_res.as_ref().is_ok_and(|&h| h >= bitcoind_height);
-            let esplora_synced = esplora_height_res.as_ref().is_ok_and(|&h| h >= bitcoind_height);
-            // If no ord URL is configured, skip ord sync check
-            let ord_synced = if self.get_ord_server_url().is_none() {
-                true
-            } else {
-                ord_height_res.as_ref().is_ok_and(|&h| h >= bitcoind_height)
-            };
-
-            log::info!(
-                "Sync attempt {}/{}: bitcoind: {}, metashrew: {} (synced: {}), esplora: {} (synced: {}), ord: {} (synced: {})",
-                i + 1,
-                max_retries,
-                bitcoind_height,
-                metashrew_height_res.map_or_else(|e| format!("err ({e})"), |h| h.to_string()),
-                metashrew_synced,
-                esplora_height_res.map_or_else(|e| format!("err ({e})"), |h| h.to_string()),
-                esplora_synced,
-                ord_height_res.map_or_else(|e| format!("err ({e})"), |h| h.to_string()),
-                ord_synced
-            );
+            let metashrew_synced = self.get_metashrew_height().await.is_ok_and(|h| h >= bitcoind_height);
+            let esplora_synced = self.get_blocks_tip_height().await.is_ok_and(|h| h >= bitcoind_height);
+            let ord_synced = self.get_ord_server_url().is_none()
+                || self.get_ord_block_count().await.is_ok_and(|h| h >= bitcoind_height);
 
             if metashrew_synced && esplora_synced && ord_synced {
-                log::info!("✅ All backends synchronized successfully!");
                 return Ok(());
             }
 
+            log::info!("Sync {}/{}: waiting (metashrew={}, esplora={}, ord={})",
+                i + 1, max_retries, metashrew_synced, esplora_synced, ord_synced);
             self.sleep_ms(2000).await;
+        }
+
+        // On mainnet, don't fail — proceed with potentially stale data
+        if is_mainnet {
+            log::warn!("Sync: indexers not fully caught up after {} attempts, proceeding anyway", max_retries);
+            return Ok(());
         }
 
         Err(AlkanesError::Other(format!("Timeout waiting for backends to sync after {max_retries} attempts")))

@@ -223,6 +223,9 @@ mod tests {
         async fn tx_script(&self, _wasm_bytes: &[u8], _inputs: Vec<u128>, _block_tag: Option<String>) -> Result<Vec<u8>, AlkanesError> {
             unimplemented!()
         }
+        async fn meta(&self, _alkane_id: &str, _block_tag: Option<String>) -> Result<Vec<u8>, AlkanesError> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]

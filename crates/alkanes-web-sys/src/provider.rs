@@ -692,7 +692,7 @@ impl WebProvider {
             };
 
             // Parse options (from_addresses, change_address, etc.)
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address) = if let Some(opts_json) = &options_json {
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, protect_taproot) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -711,6 +711,12 @@ impl WebProvider {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
+                let ord_strategy: alkanes_cli_common::alkanes::types::OrdinalsStrategy = opts.get("ordinals_strategy")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let mempool_idx = opts.get("mempool_indexer").and_then(|v| v.as_bool()).unwrap_or(false);
+                let protect_tr = opts.get("protect_taproot").and_then(|v| v.as_bool()).unwrap_or(false);
+
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
                     opts.get("mine_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -719,9 +725,12 @@ impl WebProvider {
                     from_addrs,
                     change_addr,
                     alkanes_change_addr,
+                    ord_strategy,
+                    mempool_idx,
+                    protect_tr,
                 )
             } else {
-                (false, false, true, false, None, None, None)
+                (false, false, true, false, None, None, None, Default::default(), false, false)
             };
 
             let params = EnhancedExecuteParams {
@@ -737,8 +746,9 @@ impl WebProvider {
                 trace_enabled,
                 mine_enabled,
                 auto_confirm,
-                ordinals_strategy: Default::default(),
-                mempool_indexer: false,
+                ordinals_strategy,
+                mempool_indexer,
+                protect_taproot,
             };
 
             provider.execute(params).await
@@ -792,7 +802,7 @@ impl WebProvider {
             };
 
             // Parse options
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer) = if let Some(opts_json) = &options_json {
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, protect_taproot) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -813,6 +823,7 @@ impl WebProvider {
                     .unwrap_or_default();
 
                 let mempool_idx = opts.get("mempool_indexer").and_then(|v| v.as_bool()).unwrap_or(false);
+                let protect_tr = opts.get("protect_taproot").and_then(|v| v.as_bool()).unwrap_or(true);
 
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -824,9 +835,10 @@ impl WebProvider {
                     alkanes_change_addr,
                     ord_strategy,
                     mempool_idx,
+                    protect_tr,
                 )
             } else {
-                (false, false, true, false, None, None, None, Default::default(), false)
+                (false, false, true, false, None, None, None, Default::default(), false, true)
             };
 
             let params = EnhancedExecuteParams {
@@ -844,6 +856,7 @@ impl WebProvider {
                 auto_confirm,
                 ordinals_strategy,
                 mempool_indexer,
+                protect_taproot,
             };
 
             // Use execute_full to handle the complete flow internally
@@ -6734,7 +6747,7 @@ impl JsonRpcProvider for WebProvider {
         let response_json: JsonValue = serde_json::from_str(&response_str)
             .map_err(|e| AlkanesError::Serialization(format!("Failed to parse JSON: {e}")))?;
 
-        self.logger.info(&format!("JsonRpcProvider::call <- Raw RPC response: {}", response_str));
+        self.logger.info(&format!("JsonRpcProvider::call <- Raw RPC response: {}…", &response_str[..response_str.len().min(200)]));
 
         self.logger.info("[DEBUG] call: checking for error in response");
         if let Some(error) = response_json.get("error") {
@@ -9186,6 +9199,7 @@ impl DeezelProvider for WebProvider {
             auto_confirm: false,
             ordinals_strategy: Default::default(),
             mempool_indexer: false,
+            protect_taproot: true,
         };
 
         match executor.execute(params).await? {
@@ -9224,6 +9238,7 @@ impl DeezelProvider for WebProvider {
             auto_confirm: false,
             ordinals_strategy: Default::default(),
             mempool_indexer: false,
+            protect_taproot: true,
         };
 
         match executor.execute(params).await? {

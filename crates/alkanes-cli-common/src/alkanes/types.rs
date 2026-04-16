@@ -328,6 +328,12 @@ pub struct EnhancedExecuteParams {
     /// through parent transactions to determine inscription state from settled UTXOs
     #[serde(default)]
     pub mempool_indexer: bool,
+    /// Protect taproot UTXOs from being spent for BTC fees.
+    /// When true, taproot UTXOs are only used for alkane token spending — never for BTC fee funding.
+    /// Enable for dual-address wallets (Xverse, Leather) where taproot = ordinals address.
+    /// Default: false (safe for single-address wallets like UniSat, OKX, and CLI/keystore).
+    #[serde(default)]
+    pub protect_taproot: bool,
 }
 
 /// Enhanced execute result for commit/reveal pattern

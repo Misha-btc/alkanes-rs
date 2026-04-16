@@ -19,24 +19,16 @@ local result = {
     count = 0
 }
 
--- For each UTXO, fetch its full transaction details
+-- Collect UTXO data (txid, vout, value, status with block_height).
+-- Coinbase detection is handled by the Rust parser: UTXOs with <100
+-- confirmations and no tx data are conservatively flagged as potentially-coinbase.
 for i, utxo in ipairs(utxos) do
-    local txid = utxo.txid
-    local vout = utxo.vout
-    
-    -- Fetch full transaction data for this UTXO
-    local tx_data = _RPC.esplora_tx(txid)
-    
-    -- Build UTXO entry with transaction data
-    local utxo_entry = {
-        txid = txid,
-        vout = vout,
+    table.insert(result.utxos, {
+        txid = utxo.txid,
+        vout = utxo.vout,
         value = utxo.value,
-        status = utxo.status,
-        tx = tx_data  -- Include full transaction data
-    }
-    
-    table.insert(result.utxos, utxo_entry)
+        status = utxo.status
+    })
     result.count = result.count + 1
 end
 

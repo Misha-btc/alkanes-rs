@@ -2003,6 +2003,7 @@ impl DeezelProvider for BrowserWalletProvider {
             auto_confirm: false,
             ordinals_strategy: Default::default(),
             mempool_indexer: false,
+            protect_taproot: true,
         };
 
         match executor.execute(params).await? {
@@ -2043,6 +2044,7 @@ impl DeezelProvider for BrowserWalletProvider {
             auto_confirm: false,
             ordinals_strategy: Default::default(),
             mempool_indexer: false,
+            protect_taproot: true,
         };
 
         match executor.execute(params).await? {

@@ -531,6 +531,16 @@ pub async fn check_utxos_for_inscriptions_with_provider(
             let mut split_plans: Vec<SplitPlan> = Vec::new();
             let mut inscribed_utxos: Vec<String> = Vec::new();
 
+            // Probe ord availability with the first UTXO before iterating all.
+            // On mainnet, ord returns "JSON API disabled" — skip all checks to avoid N+1 wasted calls.
+            if let Some((first_outpoint, _)) = funding_utxos.first() {
+                let output_str = format!("{}:{}", first_outpoint.txid, first_outpoint.vout);
+                if let Err(e) = provider.get_output(&output_str).await {
+                    log::warn!("⚠️ ord unavailable for probe ({}), skipping inscription checks for {} UTXOs", e, funding_utxos.len());
+                    return Ok(None);
+                }
+            }
+
             for (outpoint, txout) in funding_utxos {
                 let inscriptions = get_utxo_inscriptions_with_provider(
                     provider,

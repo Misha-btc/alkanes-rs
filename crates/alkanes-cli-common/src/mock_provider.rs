@@ -196,7 +196,7 @@ impl LogProvider for MockProvider {
 impl WalletProvider for MockProvider {
     async fn create_wallet(&mut self, _config: WalletConfig, _mnemonic: Option<String>, _passphrase: Option<String>) -> Result<WalletInfo> {
         Ok(WalletInfo {
-            address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+            address: Address::p2tr(&self.secp, self.internal_key, None, self.network).to_string(),
             network: self.network,
             mnemonic: Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string()),
         })
@@ -225,12 +225,14 @@ impl WalletProvider for MockProvider {
     }
     
     async fn get_addresses(&self, count: u32) -> Result<Vec<AddressInfo>> {
+        // Use the provider's actual taproot address for network compatibility
+        let addr = Address::p2tr(&self.secp, self.internal_key, None, self.network).to_string();
         let mut addresses = Vec::new();
         for i in 0..count {
             addresses.push(AddressInfo {
-                address: format!("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t{i}"),
-                script_type: "p2wpkh".to_string(),
-                derivation_path: format!("m/84'/0'/0'/0/{i}"),
+                address: addr.clone(),
+                script_type: "p2tr".to_string(),
+                derivation_path: format!("m/86'/1'/0'/0/{i}"),
                 index: i,
                 used: false,
             });
@@ -480,17 +482,18 @@ impl WalletProvider for MockProvider {
 #[async_trait(?Send)]
 impl AddressResolver for MockProvider {
     async fn resolve_all_identifiers(&self, input: &str) -> Result<String> {
-        // Replace identifiers with actual addresses
-        let result = input.replace("p2tr:0", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        // Replace identifiers with actual addresses (network-aware)
+        let addr = Address::p2tr(&self.secp, self.internal_key, None, self.network).to_string();
+        let result = input.replace("p2tr:0", &addr).replace("p2wpkh:0", &addr);
         Ok(result)
     }
-    
+
     fn contains_identifiers(&self, input: &str) -> bool {
         input.contains("p2tr:") || input.contains("p2wpkh:")
     }
-    
+
     async fn get_address(&self, _address_type: &str, _index: u32) -> Result<String> {
-        Ok("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string())
+        Ok(Address::p2tr(&self.secp, self.internal_key, None, self.network).to_string())
     }
     
     async fn list_identifiers(&self) -> Result<Vec<String>> {
@@ -513,7 +516,7 @@ impl BitcoinRpcProvider for MockProvider {
     }
     
     async fn get_new_address(&self) -> Result<JsonValue> {
-        Ok(serde_json::json!("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"))
+        Ok(serde_json::json!(Address::p2tr(&self.secp, self.internal_key, None, self.network).to_string()))
     }
     
     async fn get_transaction_hex(&self, txid: &str) -> Result<String> {
