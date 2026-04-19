@@ -99,6 +99,7 @@ impl<'a> WrapBtcExecutor<'a> {
             ordinals_strategy: crate::alkanes::types::OrdinalsStrategy::default(),
             mempool_indexer: false,
             protect_taproot: false,
+            payment_utxos: vec![],
         };
 
         // Execute using the enhanced alkanes executor

@@ -334,6 +334,12 @@ pub struct EnhancedExecuteParams {
     /// Default: false (safe for single-address wallets like UniSat, OKX, and CLI/keystore).
     #[serde(default)]
     pub protect_taproot: bool,
+    /// Clean BTC UTXOs for fee funding, provided by browser wallet API (e.g. UniSat getBitcoinUtxos).
+    /// Format: ["txid:vout:satoshis", ...]. When provided, SDK uses ONLY these for BTC fee inputs —
+    /// skips get_utxos lua call entirely for BTC. Alkane UTXOs still discovered via espo.
+    /// This replaces unreliable ord_output inscription detection with wallet-verified clean UTXOs.
+    #[serde(default)]
+    pub payment_utxos: Vec<String>,
 }
 
 /// Enhanced execute result for commit/reveal pattern

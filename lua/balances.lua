@@ -1,9 +1,13 @@
 -- Comprehensive balance information for an address (replacement for sandshrew_balances)
--- Args: address, protocol_tag (optional, default: "1"), asset_address (optional)
+-- Args: address, protocol_tag (optional, default: "1"), options (optional, default: "")
+--   options: comma-separated flags, e.g. "ord" to enable ord_outputs lookup
+--   By default ord is SKIPPED — it takes 40+ seconds on mainnet (unstable server).
+--   Inscription/rune detection handled by wallet APIs (UniSat) or Rebar REST.
 
 local address = args[1]
 local protocol_tag = args[2] or "1"
-local asset_address = args[3]
+local options = args[3] or ""
+local use_ord = string.find(options, "ord") ~= nil
 
 -- Determine which addresses to query
 local addresses = {address}
@@ -21,11 +25,14 @@ for _, addr in ipairs(addresses) do
     end
 end
 
--- Get ord and metashrew heights
-local ord_height = _RPC.ord_blockheight() or 0
+-- Get heights
+local ord_height = 0
+if use_ord then
+    ord_height = _RPC.ord_blockheight() or 0
+end
 local metashrew_height_str = _RPC.metashrew_height() or "0"
 local metashrew_height = tonumber(metashrew_height_str) or 0
-local max_indexed_height = math.max(ord_height, metashrew_height)
+local max_indexed_height = use_ord and math.max(ord_height, metashrew_height) or metashrew_height
 
 -- Collect results for all addresses
 local all_spendable = {}
@@ -33,17 +40,19 @@ local all_assets = {}
 local all_pending = {}
 
 for _, addr in ipairs(unique_addresses) do
-    -- Get UTXOs
     local utxos = _RPC.esplora_addressutxo(addr) or {}
 
-    -- Get protorunes/alkanes data
+    -- Get protorunes/alkanes data (fast, reliable)
     local protorunes = _RPC.alkanes_protorunesbyaddress({
         address = addr,
         protocolTag = protocol_tag
     }) or {}
 
-    -- Get ord outputs (inscriptions and runes)
-    local ord_outputs = _RPC.ord_outputs(addr) or {}
+    -- Optionally get ord outputs (inscriptions and runes) — slow on mainnet
+    local ord_outputs = {}
+    if use_ord then
+        ord_outputs = _RPC.ord_outputs(addr) or {}
+    end
 
     -- Build lookup maps
     local runes_map = {}
@@ -52,7 +61,6 @@ for _, addr in ipairs(unique_addresses) do
             if outpoint.outpoint and outpoint.runes then
                 local txid = outpoint.outpoint.txid
                 local vout = outpoint.outpoint.vout
-                -- Reverse txid for key (to match esplora format)
                 local key = txid .. ":" .. vout
                 runes_map[key] = outpoint.runes
             end
@@ -60,12 +68,14 @@ for _, addr in ipairs(unique_addresses) do
     end
 
     local ord_outputs_map = {}
-    for _, output in ipairs(ord_outputs) do
-        if output.outpoint then
-            ord_outputs_map[output.outpoint] = {
-                inscriptions = output.inscriptions or {},
-                ord_runes = output.runes or {}
-            }
+    if use_ord then
+        for _, output in ipairs(ord_outputs) do
+            if output.outpoint then
+                ord_outputs_map[output.outpoint] = {
+                    inscriptions = output.inscriptions or {},
+                    ord_runes = output.runes or {}
+                }
+            end
         end
     end
 
@@ -76,13 +86,11 @@ for _, addr in ipairs(unique_addresses) do
         local value = utxo.value
         local key = txid .. ":" .. vout
 
-        -- Get height if available
         local height = nil
         if utxo.status and utxo.status.block_height then
             height = utxo.status.block_height
         end
 
-        -- Build UTXO entry
         local utxo_entry = {
             outpoint = key,
             value = value
@@ -92,13 +100,13 @@ for _, addr in ipairs(unique_addresses) do
             utxo_entry.height = height
         end
 
-        -- Add runes if present
+        -- Add alkane runes if present
         if runes_map[key] then
             utxo_entry.runes = runes_map[key]
         end
 
-        -- Add inscriptions and ord_runes if present
-        if ord_outputs_map[key] then
+        -- Add inscriptions and ord_runes if ord enabled
+        if use_ord and ord_outputs_map[key] then
             if #ord_outputs_map[key].inscriptions > 0 then
                 utxo_entry.inscriptions = ord_outputs_map[key].inscriptions
             end
@@ -107,7 +115,7 @@ for _, addr in ipairs(unique_addresses) do
             end
         end
 
-        -- Categorize UTXO
+        -- Categorize
         local has_assets = (utxo_entry.runes and #utxo_entry.runes > 0) or
                           (utxo_entry.inscriptions and #utxo_entry.inscriptions > 0) or
                           (utxo_entry.ord_runes and next(utxo_entry.ord_runes) ~= nil)
@@ -124,7 +132,6 @@ for _, addr in ipairs(unique_addresses) do
     end
 end
 
--- Return result in sandshrew_balances format
 return {
     spendable = all_spendable,
     assets = all_assets,

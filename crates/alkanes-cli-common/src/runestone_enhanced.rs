@@ -222,7 +222,9 @@ fn extract_all_tags(integers: &[u128]) -> Value {
             if all_tags[tag.to_string()].is_null() {
                 all_tags[tag.to_string()] = json!([value]);
             } else {
-                all_tags[tag.to_string()].as_array_mut().unwrap().push(json!(value));
+                if let Some(arr) = all_tags[tag.to_string()].as_array_mut() {
+                    arr.push(json!(value));
+                }
             }
             
             i += 2;
@@ -783,7 +785,9 @@ pub fn format_runestone_with_decoded_messages(tx: &Transaction, network: bitcoin
             }
         }
         
-        result["protostones"].as_array_mut().unwrap().push(protostone_json);
+        if let Some(arr) = result["protostones"].as_array_mut() {
+            arr.push(protostone_json);
+        }
     }
     
     Ok(result)

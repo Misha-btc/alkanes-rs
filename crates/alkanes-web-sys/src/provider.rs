@@ -428,10 +428,16 @@ impl WebProvider {
                 let has_op_return = esplora_tx.vout.iter().any(|o| o.scriptpubkey_type == "op_return");
                 let mut tx_data = serde_json::to_value(&esplora_tx)
                     .map_err(|e| JsValue::from_str(&format!("Serialize failed: {}", e)))?;
-                if has_op_return {
+                // DISABLED: Runestone analysis + getrawtransaction for tx history.
+                // Protostone::from_runestone panics on some mainnet AMM transactions
+                // (upstream bug in protorune-support). The getrawtransaction calls were
+                // the main performance bottleneck — 15+ sequential calls per page load.
+                // Re-enable when protorune-support fixes the unwrap.
+                if false && has_op_return {
                     if let Ok(tx_hex) = provider.get_transaction_hex(&esplora_tx.txid).await {
                         if let Ok(tx_bytes) = hex::decode(&tx_hex) {
                             if let Ok(transaction) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(&tx_bytes) {
+                                if true {
                                 if let Ok(runestone_result) = alkanes_cli_common::runestone_enhanced::format_runestone_with_decoded_messages(&transaction, provider.network) {
                                     let num_protostones = runestone_result.get("protostones").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
                                     if num_protostones > 0 {
@@ -458,6 +464,7 @@ impl WebProvider {
                                         }
                                     }
                                 }
+                                } // if false — disabled runestone analysis
                             }
                         }
                     }
@@ -692,7 +699,7 @@ impl WebProvider {
             };
 
             // Parse options (from_addresses, change_address, etc.)
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, protect_taproot) = if let Some(opts_json) = &options_json {
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, protect_taproot, payment_utxos) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -716,6 +723,9 @@ impl WebProvider {
                     .unwrap_or_default();
                 let mempool_idx = opts.get("mempool_indexer").and_then(|v| v.as_bool()).unwrap_or(false);
                 let protect_tr = opts.get("protect_taproot").and_then(|v| v.as_bool()).unwrap_or(false);
+                let payment_utxos_parsed: Vec<String> = opts.get("payment_utxos")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
 
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -728,9 +738,10 @@ impl WebProvider {
                     ord_strategy,
                     mempool_idx,
                     protect_tr,
+                    payment_utxos_parsed,
                 )
             } else {
-                (false, false, true, false, None, None, None, Default::default(), false, false)
+                (false, false, true, false, None, None, None, Default::default(), false, false, vec![])
             };
 
             let params = EnhancedExecuteParams {
@@ -749,6 +760,7 @@ impl WebProvider {
                 ordinals_strategy,
                 mempool_indexer,
                 protect_taproot,
+                payment_utxos,
             };
 
             provider.execute(params).await
@@ -802,7 +814,7 @@ impl WebProvider {
             };
 
             // Parse options
-            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, protect_taproot) = if let Some(opts_json) = &options_json {
+            let (trace_enabled, mine_enabled, auto_confirm, raw_output, from_addresses, change_address, alkanes_change_address, ordinals_strategy, mempool_indexer, protect_taproot, payment_utxos) = if let Some(opts_json) = &options_json {
                 let opts: serde_json::Value = serde_json::from_str(opts_json)
                     .map_err(|e| JsValue::from_str(&format!("Invalid options JSON: {}", e)))?;
 
@@ -824,6 +836,9 @@ impl WebProvider {
 
                 let mempool_idx = opts.get("mempool_indexer").and_then(|v| v.as_bool()).unwrap_or(false);
                 let protect_tr = opts.get("protect_taproot").and_then(|v| v.as_bool()).unwrap_or(true);
+                let payment_utxos_parsed: Vec<String> = opts.get("payment_utxos")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
 
                 (
                     opts.get("trace_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -836,9 +851,10 @@ impl WebProvider {
                     ord_strategy,
                     mempool_idx,
                     protect_tr,
+                    payment_utxos_parsed,
                 )
             } else {
-                (false, false, true, false, None, None, None, Default::default(), false, true)
+                (false, false, true, false, None, None, None, Default::default(), false, true, vec![])
             };
 
             let params = EnhancedExecuteParams {
@@ -857,6 +873,7 @@ impl WebProvider {
                 ordinals_strategy,
                 mempool_indexer,
                 protect_taproot,
+                payment_utxos,
             };
 
             // Use execute_full to handle the complete flow internally
@@ -9031,11 +9048,19 @@ impl alkanes_cli_common::lua_script::LuaScriptExecutor for WebProvider {
         script: &alkanes_cli_common::lua_script::LuaScript,
         args: Vec<alkanes_cli_common::JsonValue>,
     ) -> alkanes_cli_common::Result<alkanes_cli_common::JsonValue> {
-        // Try cached version first
+        // Try cached execution first (fast — sends only 64-char hash, not full script).
+        // If cache miss: save script on server via lua_savescript, then execute via lua_evalscript.
+        // Next call will hit cache. Scripts are stored in-memory on server (cleared on restart).
         match self.lua_evalsaved(script.hash(), args.clone()).await {
             Ok(result) => Ok(result),
             Err(_) => {
-                // Cache miss, execute full script
+                // Cache miss — register script for future calls, then execute full
+                let _ = self.call(
+                    &self.sandshrew_rpc_url(),
+                    "lua_savescript",
+                    serde_json::json!([script.content()]),
+                    1,
+                ).await;
                 self.lua_evalscript(script.content(), args).await
             }
         }
@@ -9200,6 +9225,7 @@ impl DeezelProvider for WebProvider {
             ordinals_strategy: Default::default(),
             mempool_indexer: false,
             protect_taproot: true,
+            payment_utxos: vec![],
         };
 
         match executor.execute(params).await? {
@@ -9239,6 +9265,7 @@ impl DeezelProvider for WebProvider {
             ordinals_strategy: Default::default(),
             mempool_indexer: false,
             protect_taproot: true,
+            payment_utxos: vec![],
         };
 
         match executor.execute(params).await? {

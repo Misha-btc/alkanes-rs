@@ -502,7 +502,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         required_reveal_amount += params.to_addresses.len() as u64 * 546;
 
         let utxo_selection = self
-            .select_utxos(&[InputRequirement::Bitcoin { amount: required_reveal_amount }], &params.from_addresses, params.protect_taproot)
+            .select_utxos(&[InputRequirement::Bitcoin { amount: required_reveal_amount }], &params.from_addresses, params.protect_taproot, &params.payment_utxos)
             .await?;
         let funding_utxos = utxo_selection.outpoints.clone();
 
@@ -665,113 +665,14 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
                    total_bitcoin_needed, fee_with_buffer, bitcoin_requirement);
         
         final_requirements.push(InputRequirement::Bitcoin { amount: bitcoin_requirement });
-        let mut utxo_selection = self.select_utxos(&final_requirements, &params.from_addresses, params.protect_taproot).await?;
+        let mut utxo_selection = self.select_utxos(&final_requirements, &params.from_addresses, params.protect_taproot, &params.payment_utxos).await?;
 
-        // Check selected UTXOs for ordinal inscriptions based on strategy
-        // We need to get TxOut data for each selected UTXO to check for inscriptions
-        let mut funding_utxos_with_txout: Vec<(OutPoint, TxOut)> = Vec::new();
-        for outpoint in &utxo_selection.outpoints {
-            if let Some(txout) = self.get_utxo_cached(outpoint).await? {
-                funding_utxos_with_txout.push((*outpoint, txout));
-            }
-        }
-
-        // Check for inscriptions if ordinals_strategy is not Burn
-        // Returns (split_psbt, split_fee, updated_utxo_outpoints)
-        let (split_psbt, split_fee, final_funding_outpoints): (Option<Psbt>, Option<u64>, Vec<OutPoint>) =
-            if params.ordinals_strategy != OrdinalsStrategy::Burn {
-                log::info!("🔍 Checking selected UTXOs for ordinal inscriptions (strategy: {:?})", params.ordinals_strategy);
-                match check_utxos_for_inscriptions_with_provider(
-                    self.provider,
-                    &funding_utxos_with_txout,
-                    params.ordinals_strategy,
-                    fee_rate_sat_vb,
-                    params.mempool_indexer,
-                ).await {
-                    Ok(None) => {
-                        log::info!("✅ No ordinal inscriptions found in selected UTXOs");
-                        (None, None, utxo_selection.outpoints.clone())
-                    }
-                    Ok(Some(plans)) => {
-                        log::info!("📋 Building split transaction for {} inscribed UTXOs", plans.len());
-                        for plan in &plans {
-                            log::info!("   Split: {} → safe({}) + clean({})",
-                                plan.outpoint, plan.safe_amount, plan.clean_amount);
-                        }
-
-                        // Collect alkane data for inscribed UTXOs being split
-                        let split_utxo_alkanes: alloc::collections::BTreeMap<OutPoint, Vec<(AlkaneId, u64)>> = plans.iter()
-                            .filter_map(|plan| {
-                                utxo_selection.per_utxo_alkanes.get(&plan.outpoint)
-                                    .map(|alkanes| (plan.outpoint, alkanes.clone()))
-                            })
-                            .collect();
-
-                        if !split_utxo_alkanes.is_empty() {
-                            log::info!("🔗 Alkane-aware split: {} inscribed UTXOs carry alkanes", split_utxo_alkanes.len());
-                            for (op, alkanes) in &split_utxo_alkanes {
-                                for (alkane_id, amount) in alkanes {
-                                    log::info!("   {} has {}:{} = {} units", op, alkane_id.block, alkane_id.tx, amount);
-                                }
-                            }
-                        }
-
-                        // Build split transaction PSBT (alkane-aware)
-                        let (split_psbt_result, split_fee_result, clean_outpoints, alkane_outpoints) =
-                            self.build_split_psbt(&plans, &funding_utxos_with_txout, fee_rate_sat_vb, params, &split_utxo_alkanes).await?;
-
-                        // Replace inscribed UTXOs with clean UTXOs from split
-                        let mut new_outpoints = Vec::new();
-                        let inscribed_outpoints: std::collections::HashSet<OutPoint> =
-                            plans.iter().map(|p| p.outpoint).collect();
-
-                        // Keep non-inscribed UTXOs
-                        for outpoint in &utxo_selection.outpoints {
-                            if !inscribed_outpoints.contains(outpoint) {
-                                new_outpoints.push(*outpoint);
-                            }
-                        }
-                        // Add clean BTC UTXOs from split (for fee funding)
-                        new_outpoints.extend(clean_outpoints);
-                        // Add clean alkane UTXOs from split (for alkane spending)
-                        new_outpoints.extend(alkane_outpoints.iter().map(|(op, _)| *op));
-
-                        // Update alkanes_found: remove alkanes from inscribed UTXOs, add from alkane outpoints
-                        for plan in &plans {
-                            if let Some(alkanes) = utxo_selection.per_utxo_alkanes.get(&plan.outpoint) {
-                                for (alkane_id, _amount) in alkanes {
-                                    if let Some(_found) = utxo_selection.alkanes_found.get_mut(alkane_id) {
-                                        // The alkanes are still there, just on new outpoints now
-                                        // No need to subtract/re-add — the aggregate total is unchanged
-                                        log::debug!("Alkane {}:{} moved from inscribed UTXO {} to clean alkane output",
-                                            alkane_id.block, alkane_id.tx, plan.outpoint);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Update per_utxo_alkanes: remove inscribed UTXOs, add alkane outpoints
-                        for plan in &plans {
-                            utxo_selection.per_utxo_alkanes.remove(&plan.outpoint);
-                        }
-                        for (outpoint, alkanes) in &alkane_outpoints {
-                            utxo_selection.per_utxo_alkanes.insert(*outpoint, alkanes.clone());
-                        }
-
-                        log::info!("🔀 Split transaction built: {} clean BTC UTXOs + {} clean alkane UTXOs replace {} inscribed UTXOs",
-                            plans.len(), alkane_outpoints.len(), inscribed_outpoints.len());
-
-                        (Some(split_psbt_result), Some(split_fee_result), new_outpoints)
-                    }
-                    Err(e) => {
-                        // Strategy is Exclude and inscribed UTXOs were found - fail
-                        return Err(e);
-                    }
-                }
-            } else {
-                log::debug!("🔥 Ordinals strategy is Burn - skipping inscription check");
-                (None, None, utxo_selection.outpoints.clone())
-            };
+        // Inscription/rune UTXOs are already filtered in select_utxos via has_inscriptions/has_runes
+        // flags from balances.lua (server-side ord_outputs). No need for per-UTXO ord_output calls
+        // from browser — those are slow (5-19s each) and unreliable on mainnet ("JSON API disabled").
+        let split_psbt: Option<Psbt> = None;
+        let split_fee: Option<u64> = None;
+        let final_funding_outpoints = utxo_selection.outpoints.clone();
 
         // Calculate alkanes needed and check for excess
         let alkanes_needed = self.calculate_alkanes_needed(&params.input_requirements);
@@ -1023,7 +924,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         Ok(())
     }
 
-    async fn select_utxos(&mut self, requirements: &[InputRequirement], from_addresses: &Option<Vec<String>>, protect_taproot: bool) -> Result<UtxoSelectionResult> {
+    async fn select_utxos(&mut self, requirements: &[InputRequirement], from_addresses: &Option<Vec<String>>, protect_taproot: bool, payment_utxos: &[String]) -> Result<UtxoSelectionResult> {
         use crate::traits::AddressResolver;
         
         log::info!("Selecting UTXOs for {} requirements", requirements.len());
@@ -1047,43 +948,83 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
             log::info!("protect_taproot: taproot UTXOs reserved for alkanes only, segwit for BTC fees");
         }
 
-        let utxos = self.provider.get_utxos(true, resolved_from_addresses).await?;
-        log::debug!("Found {} total wallet UTXOs from specified sources", utxos.len());
+        // If payment_utxos provided (from wallet API like UniSat getBitcoinUtxos),
+        // use them as the BTC UTXO source instead of lua get_utxos.
+        // These are wallet-verified clean UTXOs — no inscriptions, no runes, no alkanes.
+        // Format: "txid:vout:satoshis" per entry.
+        let mut spendable_utxos: Vec<(OutPoint, UtxoInfo)> = if !payment_utxos.is_empty() {
+            let mut parsed = Vec::new();
+            for entry in payment_utxos {
+                let parts: Vec<&str> = entry.split(':').collect();
+                if parts.len() < 3 { continue; }
+                let txid_str = parts[0];
+                let vout: u32 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
+                let amount: u64 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
 
-        // Bitcoin requires coinbase outputs to have 100 confirmations before spending
-        const COINBASE_MATURITY: u32 = 100;
+                if let Ok(outpoint) = OutPoint::from_str(&format!("{}:{}", txid_str, vout)) {
+                    // Derive script_pubkey from address (first from_address)
+                    let address = resolved_from_addresses.as_ref()
+                        .and_then(|addrs| addrs.first())
+                        .cloned()
+                        .unwrap_or_default();
 
-        let mut spendable_utxos: Vec<(OutPoint, UtxoInfo)> = utxos.into_iter()
-            .filter(|(_, info)| {
-                // Filter out frozen UTXOs
-                if info.frozen {
-                    log::debug!("Skipping frozen UTXO: {}:{}", info.txid, info.vout);
-                    return false;
-                }
-                
-                // Filter out UTXOs with inscriptions or runes (from lua/ord_outputs data).
-                // This prevents inscription UTXOs from being used as fee inputs,
-                // even when the ord_output RPC is unavailable for post-selection checks.
-                if info.has_inscriptions || info.has_runes {
-                    log::debug!("Skipping UTXO with inscriptions/runes: {}:{} (inscriptions={}, runes={})",
-                        info.txid, info.vout, info.has_inscriptions, info.has_runes);
-                    return false;
-                }
+                    let script_pubkey = bitcoin::Address::from_str(&address)
+                        .ok()
+                        .and_then(|a| a.require_network(self.provider.get_network()).ok())
+                        .map(|a| a.script_pubkey());
 
-                // Filter out immature coinbase outputs
-                if info.is_coinbase && info.confirmations < COINBASE_MATURITY {
-                    log::debug!(
-                        "Skipping immature coinbase UTXO: {}:{} (confirmations: {}, required: {})",
-                        info.txid, info.vout, info.confirmations, COINBASE_MATURITY
-                    );
-                    return false;
+                    let info = UtxoInfo {
+                        txid: txid_str.to_string(),
+                        vout,
+                        amount,
+                        address,
+                        script_pubkey,
+                        confirmations: 100, // wallet-provided UTXOs are confirmed
+                        frozen: false,
+                        freeze_reason: None,
+                        block_height: None,
+                        has_inscriptions: false,
+                        has_runes: false,
+                        has_alkanes: false,
+                        is_coinbase: false,
+                    };
+                    // Cache TxOut for build_psbt_and_fee
+                    if let Some(txout) = self.utxo_info_to_txout(&info) {
+                        self.utxo_cache.insert(outpoint, txout);
+                    }
+                    parsed.push((outpoint, info));
                 }
-                
-                true
-            })
-            .collect();
-        
-        log::info!("Found {} spendable (non-frozen) wallet UTXOs", spendable_utxos.len());
+            }
+            log::info!("Using {} wallet-provided payment UTXOs (skipping lua get_utxos)", parsed.len());
+            parsed
+        } else {
+            // Standard path: fetch UTXOs via lua script
+            let utxos = self.provider.get_utxos(true, resolved_from_addresses).await?;
+            log::debug!("Found {} total wallet UTXOs from specified sources", utxos.len());
+
+            const COINBASE_MATURITY: u32 = 100;
+
+            let filtered: Vec<(OutPoint, UtxoInfo)> = utxos.into_iter()
+                .filter(|(_, info)| {
+                    if info.frozen {
+                        log::debug!("Skipping frozen UTXO: {}:{}", info.txid, info.vout);
+                        return false;
+                    }
+                    if info.has_inscriptions || info.has_runes {
+                        log::debug!("Skipping UTXO with inscriptions/runes: {}:{}", info.txid, info.vout);
+                        return false;
+                    }
+                    if info.is_coinbase && info.confirmations < COINBASE_MATURITY {
+                        log::debug!("Skipping immature coinbase UTXO: {}:{}", info.txid, info.vout);
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+
+            log::info!("Found {} spendable (non-frozen) wallet UTXOs", filtered.len());
+            filtered
+        };
 
         // Coin selection: largest UTXOs first to minimize number of inputs and fees
         spendable_utxos.sort_by(|a, b| b.1.amount.cmp(&a.1.amount));
@@ -2407,7 +2348,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         if commit_output_value < total_bitcoin_needed {
             let additional_needed = total_bitcoin_needed - commit_output_value;
             let additional_reqs = vec![InputRequirement::Bitcoin { amount: additional_needed }];
-            let utxo_selection = self.select_utxos(&additional_reqs, &params.from_addresses, params.protect_taproot).await?;
+            let utxo_selection = self.select_utxos(&additional_reqs, &params.from_addresses, params.protect_taproot, &params.payment_utxos).await?;
             selected_utxos.extend(utxo_selection.outpoints);
         }
 
@@ -2727,7 +2668,7 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
 
         // Select UTXOs for commit
         let utxo_selection = self
-            .select_utxos(&[InputRequirement::Bitcoin { amount: required_reveal_amount }], &params.from_addresses, params.protect_taproot)
+            .select_utxos(&[InputRequirement::Bitcoin { amount: required_reveal_amount }], &params.from_addresses, params.protect_taproot, &params.payment_utxos)
             .await?;
         let funding_utxos = utxo_selection.outpoints.clone();
 
@@ -3134,7 +3075,7 @@ mod tests {
         let result = executor.select_utxos(
             &[InputRequirement::Bitcoin { amount: 1000 }],
             &None,
-            false,
+            false, &[],
         ).await.unwrap();
 
         assert_eq!(result.outpoints.len(), 1);
@@ -3181,7 +3122,7 @@ mod tests {
         let result = executor.select_utxos(
             &[InputRequirement::Bitcoin { amount: 1000 }],
             &None,
-            false,
+            false, &[],
         ).await.unwrap();
 
         // Should select the largest UTXO (500k) first and stop (enough for 1000 sats)
@@ -3201,7 +3142,7 @@ mod tests {
         let result = executor.select_utxos(
             &[InputRequirement::Bitcoin { amount: 12_000 }],
             &None,
-            false,
+            false, &[],
         ).await.unwrap();
 
         // Need 12k sats, each UTXO is 5k → need at least 3
@@ -3302,7 +3243,7 @@ mod tests {
         let err = executor.select_utxos(
             &[InputRequirement::Bitcoin { amount: 10_000 }],
             &None,
-            false,
+            false, &[],
         ).await.unwrap_err();
 
         let msg = format!("{}", err);
@@ -3403,7 +3344,7 @@ mod tests {
         let err = executor.select_utxos(
             &[InputRequirement::Bitcoin { amount: 1000 }],
             &None,
-            false,
+            false, &[],
         ).await.unwrap_err();
 
         let msg = format!("{}", err);
@@ -3458,6 +3399,7 @@ mod tests {
             &[InputRequirement::Bitcoin { amount: 1000 }],
             &None,
             true, // protect taproot
+            &[],
         ).await.unwrap_err();
 
         let msg = format!("{}", err);
@@ -3478,6 +3420,7 @@ mod tests {
             &[InputRequirement::Bitcoin { amount: 1000 }],
             &None,
             false, // don't protect taproot
+            &[],
         ).await.unwrap();
 
         assert_eq!(result.outpoints.len(), 1, "protect_taproot=false should allow taproot UTXOs");
