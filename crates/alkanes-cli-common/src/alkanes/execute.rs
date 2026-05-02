@@ -667,12 +667,100 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
         final_requirements.push(InputRequirement::Bitcoin { amount: bitcoin_requirement });
         let mut utxo_selection = self.select_utxos(&final_requirements, &params.from_addresses, params.protect_taproot, &params.payment_utxos).await?;
 
-        // Inscription/rune UTXOs are already filtered in select_utxos via has_inscriptions/has_runes
-        // flags from balances.lua (server-side ord_outputs). No need for per-UTXO ord_output calls
-        // from browser — those are slow (5-19s each) and unreliable on mainnet ("JSON API disabled").
-        let split_psbt: Option<Psbt> = None;
-        let split_fee: Option<u64> = None;
-        let final_funding_outpoints = utxo_selection.outpoints.clone();
+        // Per-UTXO inscription check via ord_output. Mainnet "JSON API disabled"
+        // outage forced an earlier perf shortcut that relied on lua-side
+        // has_inscriptions / has_runes flags — but `balances.lua` no longer
+        // queries ord, so the shortcut became a silent no-op (everything
+        // marked clean → inscriptions burned). Restored here from develop
+        // (commit 78913b7f); using `get_utxo_cached` to keep the fee-input
+        // perf path that the surrounding code relies on.
+        let mut funding_utxos_with_txout: Vec<(OutPoint, TxOut)> = Vec::new();
+        for outpoint in &utxo_selection.outpoints {
+            if let Some(txout) = self.get_utxo_cached(outpoint).await? {
+                funding_utxos_with_txout.push((*outpoint, txout));
+            }
+        }
+
+        // Returns (split_psbt, split_fee, updated_utxo_outpoints).
+        let (split_psbt, split_fee, final_funding_outpoints): (Option<Psbt>, Option<u64>, Vec<OutPoint>) =
+            if params.ordinals_strategy != OrdinalsStrategy::Burn {
+                log::info!("🔍 Checking selected UTXOs for ordinal inscriptions (strategy: {:?})", params.ordinals_strategy);
+                match check_utxos_for_inscriptions_with_provider(
+                    self.provider,
+                    &funding_utxos_with_txout,
+                    params.ordinals_strategy,
+                    fee_rate_sat_vb,
+                    params.mempool_indexer,
+                ).await {
+                    Ok(None) => {
+                        log::info!("✅ No ordinal inscriptions found in selected UTXOs");
+                        (None, None, utxo_selection.outpoints.clone())
+                    }
+                    Ok(Some(plans)) => {
+                        log::info!("📋 Building split transaction for {} inscribed UTXOs", plans.len());
+                        for plan in &plans {
+                            log::info!("   Split: {} → safe({}) + clean({})",
+                                plan.outpoint, plan.safe_amount, plan.clean_amount);
+                        }
+
+                        // Collect alkane data for inscribed UTXOs being split — split-tx
+                        // routes those alkanes to a clean alkane output via protostone
+                        // edicts so they survive the split.
+                        let split_utxo_alkanes: alloc::collections::BTreeMap<OutPoint, Vec<(AlkaneId, u64)>> = plans.iter()
+                            .filter_map(|plan| {
+                                utxo_selection.per_utxo_alkanes.get(&plan.outpoint)
+                                    .map(|alkanes| (plan.outpoint, alkanes.clone()))
+                            })
+                            .collect();
+
+                        if !split_utxo_alkanes.is_empty() {
+                            log::info!("🔗 Alkane-aware split: {} inscribed UTXOs carry alkanes", split_utxo_alkanes.len());
+                            for (op, alkanes) in &split_utxo_alkanes {
+                                for (alkane_id, amount) in alkanes {
+                                    log::info!("   {} has {}:{} = {} units", op, alkane_id.block, alkane_id.tx, amount);
+                                }
+                            }
+                        }
+
+                        let (split_psbt_result, split_fee_result, clean_outpoints, alkane_outpoints) =
+                            self.build_split_psbt(&plans, &funding_utxos_with_txout, fee_rate_sat_vb, params, &split_utxo_alkanes).await?;
+
+                        // Replace inscribed UTXOs with the split's clean BTC + clean alkane outpoints.
+                        let inscribed_outpoints: std::collections::HashSet<OutPoint> =
+                            plans.iter().map(|p| p.outpoint).collect();
+                        let mut new_outpoints = Vec::new();
+                        for outpoint in &utxo_selection.outpoints {
+                            if !inscribed_outpoints.contains(outpoint) {
+                                new_outpoints.push(*outpoint);
+                            }
+                        }
+                        new_outpoints.extend(clean_outpoints);
+                        new_outpoints.extend(alkane_outpoints.iter().map(|(op, _)| *op));
+
+                        // Update per_utxo_alkanes: drop inscribed entries, add the
+                        // split's clean alkane outputs (alkanes_found aggregate is
+                        // unchanged — same totals, new outpoints).
+                        for plan in &plans {
+                            utxo_selection.per_utxo_alkanes.remove(&plan.outpoint);
+                        }
+                        for (outpoint, alkanes) in &alkane_outpoints {
+                            utxo_selection.per_utxo_alkanes.insert(*outpoint, alkanes.clone());
+                        }
+
+                        log::info!("🔀 Split transaction built: {} clean BTC UTXOs + {} clean alkane UTXOs replace {} inscribed UTXOs",
+                            plans.len(), alkane_outpoints.len(), inscribed_outpoints.len());
+
+                        (Some(split_psbt_result), Some(split_fee_result), new_outpoints)
+                    }
+                    Err(e) => {
+                        // Strategy is Exclude and inscribed UTXOs were found - fail.
+                        return Err(e);
+                    }
+                }
+            } else {
+                log::debug!("🔥 Ordinals strategy is Burn - skipping inscription check");
+                (None, None, utxo_selection.outpoints.clone())
+            };
 
         // Calculate alkanes needed and check for excess
         let alkanes_needed = self.calculate_alkanes_needed(&params.input_requirements);
@@ -1296,6 +1384,45 @@ impl<'a> EnhancedAlkanesExecutor<'a> {
                 };
                 log::info!("Added alkane UTXO {}:{} ({} sats) to spendable set", txid_str, vout, utxo_value);
                 spendable_utxos.push((outpoint, utxo_info));
+            }
+
+            // Filter out UTXOs already spent in our own mempool transactions.
+            // Indexers (espo / metashrew / protorunesbyaddress) only see confirmed
+            // state, so a pending-spent alkane UTXO still looks "available" — picking
+            // it for a second swap would create a mempool conflict at broadcast.
+            let mut mempool_spent: alloc::collections::BTreeSet<OutPoint> = Default::default();
+            for address in &addresses_to_query {
+                let mempool_txs = match self.provider.get_address_txs_mempool(address).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("get_address_txs_mempool failed for {} ({}); skipping mempool filter for this address", address, e);
+                        continue;
+                    }
+                };
+                if let Some(arr) = mempool_txs.as_array() {
+                    for tx in arr {
+                        if let Some(vin) = tx.get("vin").and_then(|v| v.as_array()) {
+                            for input in vin {
+                                if let (Some(txid_str), Some(vout)) = (
+                                    input.get("txid").and_then(|v| v.as_str()),
+                                    input.get("vout").and_then(|v| v.as_u64()),
+                                ) {
+                                    if let Ok(txid) = bitcoin::Txid::from_str(txid_str) {
+                                        mempool_spent.insert(OutPoint { txid, vout: vout as u32 });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !mempool_spent.is_empty() {
+                let before = spendable_utxos.len();
+                spendable_utxos.retain(|(op, _)| !mempool_spent.contains(op));
+                log::info!(
+                    "Filtered {} mempool-spent UTXOs from candidate set ({} → {})",
+                    mempool_spent.len(), before, spendable_utxos.len()
+                );
             }
 
             // Now process UTXOs using the pre-fetched balance data
